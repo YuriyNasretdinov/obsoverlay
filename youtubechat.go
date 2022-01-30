@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -18,8 +19,77 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"google.golang.org/api/youtube/v3"
+	youtube "google.golang.org/api/youtube/v3"
 )
+
+type LiveChatMessage struct {
+	Author string
+	Text   string
+}
+
+func createYoutubeClient() (service *youtube.Service, liveChatID string, err error) {
+	secret, err := ioutil.ReadFile(*secretFile)
+	if err != nil {
+		return nil, "", fmt.Errorf("reading secret file: %v", err)
+	}
+
+	config := &oauth2.Config{
+		ClientID:     *clientID,
+		ClientSecret: strings.TrimSpace(string(secret)),
+		Endpoint:     google.Endpoint,
+		Scopes:       []string{youtube.YoutubeScope},
+	}
+
+	cl := newOAuthClient(context.Background(), config)
+
+	service, err = youtube.New(cl)
+	if err != nil {
+		return nil, "", fmt.Errorf("creating YouTube service: %v", err)
+	}
+
+	resp, err := service.LiveBroadcasts.List(nil).BroadcastStatus("active").Do()
+	if err != nil {
+		return nil, "", fmt.Errorf("list live broadcasts: %v", err)
+	}
+
+	if len(resp.Items) != 1 {
+		return nil, "", fmt.Errorf("unexpected number of live broadcasts: %d, want 1", len(resp.Items))
+	}
+
+	return service, resp.Items[0].Snippet.LiveChatId, nil
+}
+
+func fetchMsgs(ctx context.Context, service *youtube.Service, liveChatId, nextPageToken string) (res []*LiveChatMessage, nextToken string, sleepInterval time.Duration, err error) {
+	if service == nil {
+		res = append(res, &LiveChatMessage{
+			Author: "Error",
+			Text:   fmt.Sprintf("Look at logs comrade %d", time.Now().Unix()),
+		})
+		return res, "", time.Second * 10, nil
+	}
+
+	req := service.LiveChatMessages.
+		List(liveChatId, []string{"id", "snippet", "authorDetails"}).
+		Context(ctx)
+
+	if nextPageToken != "" {
+		req = req.PageToken(nextPageToken)
+	}
+
+	msgs, err := req.Do()
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("listing live chat messages: %v", err)
+	}
+
+	for _, m := range msgs.Items {
+		res = append(res, &LiveChatMessage{
+			Author: m.AuthorDetails.DisplayName,
+			Text:   m.Snippet.DisplayMessage,
+		})
+	}
+
+	return res, msgs.NextPageToken, time.Duration(msgs.PollingIntervalMillis) * time.Millisecond, nil
+}
 
 func osUserCacheDir() string {
 	switch runtime.GOOS {
@@ -61,6 +131,19 @@ func saveToken(file string, token *oauth2.Token) {
 	gob.NewEncoder(f).Encode(token)
 }
 
+func newOAuthClient(ctx context.Context, config *oauth2.Config) *http.Client {
+	cacheFile := tokenCacheFile(config)
+	token, err := tokenFromFile(cacheFile)
+	if err != nil {
+		token = tokenFromWeb(ctx, config)
+		saveToken(cacheFile, token)
+	} else {
+		log.Printf("Using cached token from %q", cacheFile)
+	}
+
+	return config.Client(ctx, token)
+}
+
 func tokenFromWeb(ctx context.Context, config *oauth2.Config) *oauth2.Token {
 	ch := make(chan string)
 	randState := fmt.Sprintf("st%d", time.Now().UnixNano())
@@ -87,7 +170,7 @@ func tokenFromWeb(ctx context.Context, config *oauth2.Config) *oauth2.Token {
 
 	config.RedirectURL = ts.URL
 	authURL := config.AuthCodeURL(randState)
-
+	go openURL(authURL)
 	log.Printf("Authorize this app at: %s", authURL)
 	code := <-ch
 	log.Printf("Got code: %s", code)
@@ -99,41 +182,24 @@ func tokenFromWeb(ctx context.Context, config *oauth2.Config) *oauth2.Token {
 	return token
 }
 
-func newOAuthClient(ctx context.Context, config *oauth2.Config) *http.Client {
-	cacheFile := tokenCacheFile(config)
-	token, err := tokenFromFile(cacheFile)
-	if err != nil {
-		token = tokenFromWeb(ctx, config)
-		saveToken(cacheFile, token)
-	} else {
-		log.Printf("Using cached token %#v from %q", token, cacheFile)
+func openURL(url string) {
+	try := []string{"xdg-open", "google-chrome", "open"}
+	for _, bin := range try {
+		err := exec.Command(bin, url).Run()
+		if err == nil {
+			return
+		}
 	}
-
-	return config.Client(ctx, token)
+	log.Printf("Error opening URL in browser.")
 }
 
-func testYoutube() {
-	secret, err := ioutil.ReadFile(*clientSecretFile)
-	if err != nil {
-		log.Fatalf("Can't read OAuth secret file: %v", err)
+func valueOrFileContents(value string, filename string) string {
+	if value != "" {
+		return value
 	}
-
-	client := newOAuthClient(context.Background(), &oauth2.Config{
-		ClientID:     *clientID,
-		ClientSecret: string(secret),
-		Endpoint:     google.Endpoint,
-		Scopes:       []string{youtube.YoutubeScope},
-	})
-
-	svc, err := youtube.New(client)
+	slurp, err := ioutil.ReadFile(filename)
 	if err != nil {
-		log.Fatalf("Failed to create a YouTube client: %v", err)
+		log.Fatalf("Error reading %q: %v", filename, err)
 	}
-
-	resp, err := svc.LiveStreams.List([]string{""}).Do()
-	if err != nil {
-		log.Fatalf("Failed to list live streams: %v", err)
-	}
-
-	log.Printf("Live steams: %v", resp)
+	return strings.TrimSpace(string(slurp))
 }

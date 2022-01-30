@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,47 +17,121 @@ import (
 	"time"
 
 	"golang.org/x/net/websocket"
+	"google.golang.org/api/youtube/v3"
 )
 
 var timeout = flag.Duration("timeout", time.Second*20, "timeout for tests")
-var clientID = flag.String("client-id", "", "YouTube OAuth Client ID")
-var clientSecretFile = flag.String("client-secret", "", "YouTube OAuth Client Secret File Path")
-var testYoutubeFlag = flag.Bool("testyoutube", false, "Test youtube")
+var clientID = flag.String("client-id", "", "Youtube API client ID")
+var secretFile = flag.String("secret-file", "", "File that contains Youtube API secret")
+
+type eventHandler struct {
+	service    *youtube.Service
+	liveChatID string
+}
+
+type YoutubeMessage struct {
+	Author string `json:"author"`
+	Text   string `json:"text"`
+}
+
+type Message struct {
+	Running        bool            `json:"running,omitempty"`
+	TestsError     string          `json:"testsError,omitempty"`
+	TestsSuccess   bool            `json:"testsSuccess,omitempty"`
+	YoutubeMessage *YoutubeMessage `json:"youtubeMessage,omitempty"`
+}
 
 func main() {
 	flag.Parse()
 
-	if *testYoutubeFlag {
-		testYoutube()
-		return
+	service, liveChatID, err := createYoutubeClient()
+	if err != nil {
+		log.Printf("Failed to create YouTube client: %v", err)
+	}
+
+	log.Printf("Live broadcast had ID %q", liveChatID)
+
+	h := &eventHandler{
+		service:    service,
+		liveChatID: liveChatID,
 	}
 
 	http.HandleFunc("/", indexHandler)
-	http.Handle("/events", websocket.Handler(eventsHandler))
+	http.Handle("/events", websocket.Handler(h.HandleWebsocket))
 
 	log.Printf("Running")
 	log.Fatal(http.ListenAndServe(":80", nil))
 }
 
-func eventsHandler(ws *websocket.Conn) {
-	eofCh := make(chan bool, 1)
+func (h *eventHandler) HandleWebsocket(ws *websocket.Conn) {
+	ctx, cancel := context.WithCancel(ws.Request().Context())
+	defer cancel()
+
 	go func() {
 		ws.Read(make([]byte, 100))
-		eofCh <- true
+		cancel()
 	}()
 
+	messages := make(chan Message)
+
+	// Sending using select{} so that we don't block forever
+	// if context is cancelled.
+	send := func(m Message) {
+		select {
+		case <-ctx.Done():
+			return
+		case messages <- m:
+		}
+	}
+
+	go h.testResultsThread(ctx, send)
+	go h.displayYoutubeChatThread(ctx, send)
+
 	enc := json.NewEncoder(ws)
+	for m := range messages {
+		enc.Encode(&m)
+	}
+}
 
-	var lastSize int64
-
+func (h *eventHandler) displayYoutubeChatThread(ctx context.Context, send func(Message)) {
+	nextPageToken := ""
 	for {
 		select {
-		case <-eofCh:
+		case <-ctx.Done():
 			return
 		default:
 		}
 
-		time.Sleep(time.Millisecond * 100)
+		res, nextPageTokenTmp, sleepInterval, err := fetchMsgs(ctx, h.service, h.liveChatID, nextPageToken)
+		if err != nil {
+			log.Printf("Error fetching live chat messages: %v", err)
+			time.Sleep(time.Second * 10)
+			continue
+		}
+
+		for _, m := range res {
+			send(Message{
+				YoutubeMessage: &YoutubeMessage{
+					Author: m.Author,
+					Text:   m.Text,
+				},
+			})
+		}
+
+		nextPageToken = nextPageTokenTmp
+		time.Sleep(sleepInterval)
+	}
+}
+
+func (h *eventHandler) testResultsThread(ctx context.Context, send func(Message)) {
+	var lastSize int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Millisecond * 100):
+		}
 
 		st, err := os.Stat("/tmp/saved")
 		if err != nil {
@@ -68,8 +144,8 @@ func eventsHandler(ws *websocket.Conn) {
 			continue
 		}
 
-		enc.Encode(map[string]interface{}{
-			"running": true,
+		send(Message{
+			Running: true,
 		})
 
 		lastSize = st.Size()
@@ -77,68 +153,24 @@ func eventsHandler(ws *websocket.Conn) {
 		log.Printf("runTest() result: %v", err)
 
 		if err != nil {
-			enc.Encode(map[string]interface{}{
-				"testsError": err.Error(),
+			send(Message{
+				TestsError: err.Error(),
 			})
 		} else {
-			enc.Encode(map[string]interface{}{
-				"testsSuccess": true,
+			send(Message{
+				TestsSuccess: true,
 			})
 		}
-
 	}
-
 }
+
+//go:embed index.html
+var indexHTML string
 
 func indexHandler(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", `text/html; charset="UTF-8"`)
 
-	io.WriteString(w, `
-	<html>
-	<head><title>Yuri's stream</title></head>
-	<body>
-	<div style="position: absolute; right: 0; top: 0; font-size: 40px; padding: 5px; color: white; font-family: 'Helvetica'; text-shadow: 2px 2px 4px #000000; background-color:rgba(0, 0, 0, 0.5);">
-	github.com/YuriyNasretdinov/chukcha
-	</div>
-
-	<div id="tests" style="position: absolute; bottom: 0; right: 0; font-size: 40px; font-family: 'Helvetica'; text-shadow: 2px 2px 4px #000000; background-color: black; padding: 5px;">
-	
-	</div>
-
-	<script>
-	function setWebsocketConnection() {
-		var websocket = new WebSocket("ws" + (window.location.protocol.indexOf("https") >= 0 ? "s" : "") + "://" + window.location.host + "/events")
-		websocket.onopen = function(evt) {
-			console.log("open")
-		}
-		websocket.onclose = function(evt) {
-			console.log("close")
-			setTimeout(setWebsocketConnection, 1000)
-		}
-		websocket.onmessage = onMessage
-		websocket.onerror = function(evt) { console.log("Error: " + evt) }
-	}
-
-	function onMessage(evt) {
-		var reply = JSON.parse(evt.data)
-		var el = document.getElementById("tests")
-		if (reply.running) {
-			el.innerHTML = 'running tests'
-			el.style.color = 'white'
-		} else if (reply.testsSuccess) {
-			el.innerHTML = 'tests passing'
-			el.style.color = 'green'
-		} else if (reply.testsError) {
-			el.innerHTML = reply.testsError
-			el.style.color = 'red'
-		}
-	}
-
-	setWebsocketConnection();
-	</script>
-	</body>
-	</html>
-	`)
+	io.WriteString(w, indexHTML)
 }
 
 func runTest() error {
