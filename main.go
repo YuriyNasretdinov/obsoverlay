@@ -20,6 +20,8 @@ import (
 	"google.golang.org/api/youtube/v3"
 )
 
+const savedFilePath = "/tmp/saved"
+
 var timeout = flag.Duration("timeout", time.Second*20, "timeout for tests")
 var clientID = flag.String("client-id", "", "Youtube API client ID")
 var secretFile = flag.String("secret-file", "", "File that contains Youtube API secret")
@@ -116,10 +118,35 @@ func (h *eventHandler) displayYoutubeChatThread(ctx context.Context, send func(M
 					Text:   m.Text,
 				},
 			})
+
+			h.onMessage(m.Text)
 		}
 
 		nextPageToken = nextPageTokenTmp
+
+		// looks like YouTube API limits are much lower than I thought.
+		if minSleep := time.Second * 5; sleepInterval < minSleep {
+			sleepInterval = minSleep
+		}
+
 		time.Sleep(sleepInterval)
+	}
+}
+
+func (h *eventHandler) onMessage(text string) {
+	switch strings.TrimSpace(text) {
+	case "!test", "!tests", "!runtest", "!run", "!gotest", "!go test":
+		fp, err := os.OpenFile(savedFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			log.Printf("Failed to create open file: %v", err)
+			return
+		}
+		defer fp.Close()
+
+		if _, err := fp.Write([]byte("1\n")); err != nil {
+			log.Printf("Failed to write to saved file: %v", err)
+			return
+		}
 	}
 }
 
@@ -133,7 +160,7 @@ func (h *eventHandler) testResultsThread(ctx context.Context, send func(Message)
 		case <-time.After(time.Millisecond * 100):
 		}
 
-		st, err := os.Stat("/tmp/saved")
+		st, err := os.Stat(savedFilePath)
 		if err != nil {
 			log.Printf("saved file: %v", err)
 			time.Sleep(time.Second * 5)
