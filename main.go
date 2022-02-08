@@ -16,7 +16,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mxmCherry/translit/ruicao"
+	"github.com/pemistahl/lingua-go"
 	"golang.org/x/net/websocket"
+	"golang.org/x/text/transform"
 	"google.golang.org/api/youtube/v3"
 )
 
@@ -27,8 +30,10 @@ var clientID = flag.String("client-id", "", "Youtube API client ID")
 var secretFile = flag.String("secret-file", "", "File that contains Youtube API secret")
 
 type eventHandler struct {
-	service    *youtube.Service
-	liveChatID string
+	service     *youtube.Service
+	liveChatID  string
+	detector    lingua.LanguageDetector
+	transformer transform.Transformer
 }
 
 type YoutubeMessage struct {
@@ -53,9 +58,23 @@ func main() {
 
 	log.Printf("Live broadcast had ID %q", liveChatID)
 
+	languages := []lingua.Language{
+		lingua.English,
+		lingua.French,
+		lingua.German,
+		lingua.Spanish,
+		lingua.Russian,
+	}
+
+	detector := lingua.NewLanguageDetectorBuilder().
+		FromLanguages(languages...).
+		Build()
+
 	h := &eventHandler{
-		service:    service,
-		liveChatID: liveChatID,
+		service:     service,
+		liveChatID:  liveChatID,
+		detector:    detector,
+		transformer: ruicao.ToLatin().Transformer(),
 	}
 
 	http.HandleFunc("/", indexHandler)
@@ -112,14 +131,22 @@ func (h *eventHandler) displayYoutubeChatThread(ctx context.Context, send func(M
 		}
 
 		for _, m := range res {
+			text := m.Text
+			if lang, ok := h.detector.DetectLanguageOf(m.Text); ok && lang == lingua.Russian {
+				translit, _, _ := transform.String(h.transformer, m.Text)
+				if translit != "" {
+					text = m.Text + " [" + translit + "]"
+				}
+			}
+
 			send(Message{
 				YoutubeMessage: &YoutubeMessage{
 					Author: m.Author,
-					Text:   m.Text,
+					Text:   text,
 				},
 			})
 
-			h.onMessage(m.Text)
+			h.onMessage(text)
 		}
 
 		nextPageToken = nextPageTokenTmp

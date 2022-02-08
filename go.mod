@@ -24,6 +24,8 @@ require (
 	cloud.google.com/go v0.100.2 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/kr/pretty v0.3.0
+	github.com/mxmCherry/translit v1.0.0
+	github.com/pemistahl/lingua-go v1.0.5
 	google.golang.org/api v0.65.0
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/protobuf v1.27.1 // indirect
