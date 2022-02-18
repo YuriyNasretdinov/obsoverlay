@@ -1,40 +1,40 @@
 <html>
 	<head>
-        <title>Yuri's stream</title>
-        <style type="text/css">
-            #chat {
-                position: absolute;
-                top: 0;
-                left: 0;
-                font-size: 30px;
-                font-family: 'Helvetica';
-                text-shadow: 2px 2px 4px #000000;
-                background-color: rgba(0, 0, 0, 0.7);
-                color: white;
-                padding: 5px;
-                max-height: 600px;
-                max-width: 550px;
-                overflow-y: hidden;
-                overflow-wrap: break-word;
-            }
+		<title>Yuri's stream</title>
+		<style type="text/css">
+			#chat {
+				position: absolute;
+				top: 0;
+				left: 0;
+				font-size: 30px;
+				font-family: 'Helvetica';
+				text-shadow: 2px 2px 4px #000000;
+				background-color: rgba(0, 0, 0, 0.7);
+				color: white;
+				padding: 5px;
+				max-height: 600px;
+				max-width: 550px;
+				overflow-y: hidden;
+				overflow-wrap: break-word;
+			}
 
-            #tests {
-                position: absolute;
-                bottom: 0; right: 0;
-                font-size: 40px;
-                font-family: 'Helvetica';
-                text-shadow: 2px 2px 4px #000000;
-                background-color: black;
-                padding: 5px;
-            }
-        </style>
-    </head>
+			#tests {
+				position: absolute;
+				bottom: 0; right: 0;
+				font-size: 40px;
+				font-family: 'Helvetica';
+				text-shadow: 2px 2px 4px #000000;
+				background-color: black;
+				padding: 5px;
+			}
+		</style>
+	</head>
 	<body>
 	<div style="position: absolute; right: 0; top: 0; font-size: 40px; padding: 5px; color: white; font-family: 'Helvetica'; text-shadow: 2px 2px 4px #000000; background-color:rgba(0, 0, 0, 0.5);">
 	github.com/YuriyNasretdinov/chukcha
 	</div>
 
-    <div id="chat">
+	<div id="chat">
 	
 	</div>
 
@@ -56,39 +56,75 @@
 		websocket.onerror = function(evt) { console.log("Error: " + evt) }
 	}
 
-    function onYoutubeChatMessage(msg) {
-        var el = document.getElementById("chat")
-        while (el.scrollHeight >= 600) {
-            el.removeChild(el.firstChild)
-        }
+	var redComrads = {
+		"UCNExjyfHMv4QNcrU9EZDHkA": true, // comrad Zhe Sun donated access to their VM
+		"UC1mUQrDuS9LzmRVoxgsvl9g": true, // comrad Ravi Tej donated access to their Opteron machine
+		"UCXl4MwMjFPGbfhRhR6gak_Q": true, // comrad Giuseppe Capasso donated access to their Raspberry Pi
+	}
 
-        var div = document.createElement('div')
-        setTimeout(function() {
-            el.removeChild(div)
-        }, 20000)
-        var textNode = document.createTextNode(msg.author + ": " + msg.text)
-        div.appendChild(textNode)
-        el.appendChild(div)
-    }
+	var yellowComrads = {
+		"UC3Lhz4sPFPbH2TDtTxmNiQg": true, // comrad SovietReliable
+	}
+
+	function onYoutubeChatMessage(msg) {
+		var el = document.getElementById("chat")
+		while (el.scrollHeight >= 600) {
+			el.removeChild(el.firstChild)
+		}
+
+		var div = document.createElement('div')
+		div.style.transition = "opacity 0.2s ease"
+		setTimeout(function() {
+			div.style.opacity = 0
+			setTimeout(function() {
+				el.removeChild(div)
+			}, 200)
+		}, 20000)
+
+		if (msg.avatar) {
+			var img = document.createElement('img')
+			img.src = msg.avatar
+			img.width = 30
+			img.height = 30
+			img.style.marginRight = '10px'
+			div.appendChild(img)
+		}
+
+		var span = document.createElement('span')
+		span.style.fontWeight = 'bold'
+		span.appendChild(document.createTextNode(msg.author))
+		if (redComrads[msg.channel_id]) {
+			span.style.color = 'red'
+		} else if (yellowComrads[msg.channel_id]) {
+			span.style.color = 'yellow'
+		}
+
+		div.appendChild(span)
+		div.appendChild(document.createTextNode(": " + msg.text))
+		el.appendChild(div)
+	}
 
 	function onMessage(evt) {
 		var reply = JSON.parse(evt.data)
 		var el = document.getElementById("tests")
-		if (reply.running) {
-			el.innerHTML = 'running tests'
+		if (reply.fatalError) {
+			el.innerHTML = 'fatal overlay error: ' + reply.fatalError
+			el.style.color = 'red'
+		} else if (reply.running) {
+			el.innerHTML = 'running tests' + (reply.testsRace ? ' with -race (can take a while)' : '')
 			el.style.color = 'white'
 		} else if (reply.testsSuccess) {
-			el.innerHTML = 'tests passing'
+			el.innerHTML = 'tests passed' + (reply.testsRace ? ' with -race' : '')
 			el.style.color = 'green'
 		} else if (reply.testsError) {
 			el.innerHTML = reply.testsError
 			el.style.color = 'red'
 		} else if (reply.youtubeMessage) {
-            onYoutubeChatMessage(reply.youtubeMessage)
-        }
+			onYoutubeChatMessage(reply.youtubeMessage)
+		}
 	}
 
 	setWebsocketConnection();
 	</script>
 	</body>
-	</html>
+</html>

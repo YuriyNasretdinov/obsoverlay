@@ -23,8 +23,10 @@ import (
 )
 
 type LiveChatMessage struct {
-	Author string
-	Text   string
+	ChannelID string
+	Avatar    string
+	Author    string
+	Text      string
 }
 
 func createYoutubeClient() (service *youtube.Service, liveChatID string, err error) {
@@ -47,9 +49,13 @@ func createYoutubeClient() (service *youtube.Service, liveChatID string, err err
 		return nil, "", fmt.Errorf("creating YouTube service: %v", err)
 	}
 
-	resp, err := service.LiveBroadcasts.List(nil).BroadcastStatus("active").Do()
+	resp, err := service.LiveBroadcasts.List(nil).BroadcastStatus("all").MaxResults(1).Do()
 	if err != nil {
 		return nil, "", fmt.Errorf("list live broadcasts: %v", err)
+	}
+
+	for _, it := range resp.Items {
+		log.Printf("title: %s, live chat id: %s", it.Snippet.Title, it.Snippet.LiveChatId)
 	}
 
 	if len(resp.Items) != 1 {
@@ -83,8 +89,10 @@ func fetchMsgs(ctx context.Context, service *youtube.Service, liveChatId, nextPa
 
 	for _, m := range msgs.Items {
 		res = append(res, &LiveChatMessage{
-			Author: m.AuthorDetails.DisplayName,
-			Text:   m.Snippet.DisplayMessage,
+			ChannelID: m.AuthorDetails.ChannelId,
+			Avatar:    m.AuthorDetails.ProfileImageUrl,
+			Author:    m.AuthorDetails.DisplayName,
+			Text:      m.Snippet.DisplayMessage,
 		})
 	}
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -8,11 +9,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,6 +33,8 @@ var clientID = flag.String("client-id", "", "Youtube API client ID")
 var secretFile = flag.String("secret-file", "", "File that contains Youtube API secret")
 
 type eventHandler struct {
+	currentConnections int32
+
 	service     *youtube.Service
 	liveChatID  string
 	detector    lingua.LanguageDetector
@@ -37,14 +42,18 @@ type eventHandler struct {
 }
 
 type YoutubeMessage struct {
-	Author string `json:"author"`
-	Text   string `json:"text"`
+	ChannelID string `json:"channel_id"`
+	Avatar    string `json:"avatar"`
+	Author    string `json:"author"`
+	Text      string `json:"text"`
 }
 
 type Message struct {
 	Running        bool            `json:"running,omitempty"`
+	FatalError     string          `json:"fatalError,omitempty"`
 	TestsError     string          `json:"testsError,omitempty"`
 	TestsSuccess   bool            `json:"testsSuccess,omitempty"`
+	TestsRace      bool            `json:"testsRace,omitempty"`
 	YoutubeMessage *YoutubeMessage `json:"youtubeMessage,omitempty"`
 }
 
@@ -88,6 +97,18 @@ func (h *eventHandler) HandleWebsocket(ws *websocket.Conn) {
 	ctx, cancel := context.WithCancel(ws.Request().Context())
 	defer cancel()
 
+	enc := json.NewEncoder(ws)
+
+	currConn := atomic.AddInt32(&h.currentConnections, 1)
+	defer atomic.AddInt32(&h.currentConnections, -1)
+
+	if currConn > 1 {
+		enc.Encode(Message{
+			FatalError: fmt.Sprintf("too many connections: %v (max allowed is 1)", currConn),
+		})
+		return
+	}
+
 	go func() {
 		ws.Read(make([]byte, 100))
 		cancel()
@@ -100,6 +121,7 @@ func (h *eventHandler) HandleWebsocket(ws *websocket.Conn) {
 	send := func(m Message) {
 		select {
 		case <-ctx.Done():
+			close(messages)
 			return
 		case messages <- m:
 		}
@@ -108,7 +130,6 @@ func (h *eventHandler) HandleWebsocket(ws *websocket.Conn) {
 	go h.testResultsThread(ctx, send)
 	go h.displayYoutubeChatThread(ctx, send)
 
-	enc := json.NewEncoder(ws)
 	for m := range messages {
 		enc.Encode(&m)
 	}
@@ -141,8 +162,10 @@ func (h *eventHandler) displayYoutubeChatThread(ctx context.Context, send func(M
 
 			send(Message{
 				YoutubeMessage: &YoutubeMessage{
-					Author: m.Author,
-					Text:   text,
+					ChannelID: m.ChannelID,
+					Avatar:    m.Avatar,
+					Author:    m.Author,
+					Text:      text,
 				},
 			})
 
@@ -174,11 +197,23 @@ func (h *eventHandler) onMessage(text string) {
 			log.Printf("Failed to write to saved file: %v", err)
 			return
 		}
+	case "!testrace", "!test -race", "!tests -race", "!go test -race", "!gotest -race", "!runtest -race", "!runtest race":
+		fp, err := os.OpenFile(savedFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			log.Printf("Failed to create open file: %v", err)
+			return
+		}
+		defer fp.Close()
+
+		if _, err := fp.Write([]byte("race\n")); err != nil {
+			log.Printf("Failed to write to saved file: %v", err)
+			return
+		}
 	}
 }
 
 func (h *eventHandler) testResultsThread(ctx context.Context, send func(Message)) {
-	var lastSize int64
+	var lastSize int
 
 	for {
 		select {
@@ -187,32 +222,37 @@ func (h *eventHandler) testResultsThread(ctx context.Context, send func(Message)
 		case <-time.After(time.Millisecond * 100):
 		}
 
-		st, err := os.Stat(savedFilePath)
+		// I'm lazy so we'll read the whole file every 100ms :)
+		contents, err := ioutil.ReadFile(savedFilePath)
 		if err != nil {
-			log.Printf("saved file: %v", err)
+			log.Printf("Failed to stat saved file: %v", err)
 			time.Sleep(time.Second * 5)
 			continue
 		}
 
-		if st.Size() == lastSize {
+		if len(contents) <= lastSize {
 			continue
 		}
 
+		race := bytes.Contains(contents[lastSize:], []byte("race"))
 		send(Message{
-			Running: true,
+			Running:   true,
+			TestsRace: race,
 		})
 
-		lastSize = st.Size()
-		err = runTest()
+		lastSize = len(contents)
+		err = runTest(race)
 		log.Printf("runTest() result: %v", err)
 
 		if err != nil {
 			send(Message{
 				TestsError: err.Error(),
+				TestsRace:  race,
 			})
 		} else {
 			send(Message{
 				TestsSuccess: true,
+				TestsRace:    race,
 			})
 		}
 	}
@@ -227,7 +267,7 @@ func indexHandler(w http.ResponseWriter, req *http.Request) {
 	io.WriteString(w, indexHTML)
 }
 
-func runTest() error {
+func runTest(race bool) error {
 	tmpdir, err := os.MkdirTemp(os.TempDir(), "chukchatest")
 	if err != nil {
 		return fmt.Errorf("creating temp dir: %v", err)
@@ -243,7 +283,13 @@ func runTest() error {
 		}
 	}
 
-	cmd := exec.Command("go", "test", "-v", "./...")
+	args := []string{"test", "-v"}
+	if race {
+		args = append(args, "-race")
+	}
+	args = append(args, "./...")
+
+	cmd := exec.Command("go", args...)
 	cmd.Dir = os.ExpandEnv("$HOME/chukcha")
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -264,13 +310,19 @@ func runTest() error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- cmd.Wait() }()
 
+	timeoutDuration := *timeout
+	if race {
+		// tests with -race take significantly longer
+		timeoutDuration *= 5
+	}
+
 	select {
 	case err := <-errCh:
 		log.Printf("tests result: %v", err)
 		if err != nil {
 			return fmt.Errorf("error running tests: %v", err)
 		}
-	case <-time.After(*timeout):
+	case <-time.After(timeoutDuration):
 		return errors.New("tests timed out")
 	}
 
